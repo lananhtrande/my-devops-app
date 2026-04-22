@@ -1,4 +1,4 @@
-name: Build and Push Docker Image
+name: CI/CD Pipeline
 
 on:
   push:
@@ -6,7 +6,24 @@ on:
       - main
 
 jobs:
+
+  # 🧪 1. TEST STAGE
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Basic test (example)
+        run: |
+          echo "Running tests..."
+          # Add real tests here later
+          ls -la
+
+  # 🐳 2. BUILD & PUSH
   build:
+    needs: test
     runs-on: ubuntu-latest
 
     steps:
@@ -22,10 +39,39 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build and push Docker image
+      - name: Generate version tag
+        id: version
+        run: echo "TAG=v1.${{ github.run_number }}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
-          tags: lananh03/my-devops-app:latest
+          tags: |
+            lananh03/my-devops-app:latest
+            lananh03/my-devops-app:${{ steps.version.outputs.TAG }}
+
+  # 🚀 3. DEPLOY TO EC2
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            docker pull lananh03/my-devops-app:latest
+
+            docker stop nginx-container || true
+            docker rm nginx-container || true
+
+            docker run -d \
+              --name nginx-container \
+              -p 80:80 -p 443:443 \
+              lananh03/my-devops-app:latest
