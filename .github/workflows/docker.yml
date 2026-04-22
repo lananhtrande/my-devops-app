@@ -1,13 +1,18 @@
-name: CI/CD Pipeline
+name: CI/CD Pipeline (Build + Deploy)
 
 on:
   push:
     branches:
       - main
 
+env:
+  IMAGE_NAME: lananh03/my-devops-app
+
 jobs:
 
+  # =========================
   # 🧪 1. TEST STAGE
+  # =========================
   test:
     runs-on: ubuntu-latest
 
@@ -15,16 +20,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Basic test (example)
+      - name: Run basic tests
         run: |
           echo "Running tests..."
-          # Add real tests here later
           ls -la
+          # 👉 Replace with real tests later (npm test, etc.)
 
+  # =========================
   # 🐳 2. BUILD & PUSH
+  # =========================
   build:
     needs: test
     runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
 
     steps:
       - name: Checkout code
@@ -33,45 +43,109 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Generate image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA}" >> $GITHUB_OUTPUT
+
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Generate version tag
-        id: version
-        run: echo "TAG=v1.${{ github.run_number }}" >> $GITHUB_OUTPUT
-
-      - name: Build and push
+      - name: Build and push image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
-            lananh03/my-devops-app:latest
-            lananh03/my-devops-app:${{ steps.version.outputs.TAG }}
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
 
-  # 🚀 3. DEPLOY TO EC2
+  # =========================
+  # 🚀 3. DEPLOY (BLUE/GREEN)
+  # =========================
   deploy:
     needs: build
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy via SSH
+      - name: Deploy to EC2 via SSH
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USER }}
           key: ${{ secrets.EC2_SSH_KEY }}
           script: |
-            docker pull lananh03/my-devops-app:latest
 
-            docker stop nginx-container || true
-            docker rm nginx-container || true
+            set -e
 
+            IMAGE="${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}"
+            PREFIX="nginx"
+
+            echo "📥 Pulling image: $IMAGE"
+            docker pull $IMAGE
+
+            # Determine active container
+            if docker ps --format '{{.Names}}' | grep -q ${PREFIX}-blue; then
+              CURRENT="blue"
+              NEXT="green"
+            else
+              CURRENT="green"
+              NEXT="blue"
+            fi
+
+            echo "🔄 Current: $CURRENT → Deploying: $NEXT"
+
+            # Cleanup previous NEXT container if exists
+            docker rm -f ${PREFIX}-${NEXT} || true
+
+            # Start new container on temp ports
             docker run -d \
-              --name nginx-container \
-              -p 80:80 -p 443:443 \
-              lananh03/my-devops-app:latest
+              --name ${PREFIX}-${NEXT} \
+              -p 8080:80 \
+              -p 8443:443 \
+              $IMAGE
+
+            echo "⏳ Waiting for health check..."
+
+            HEALTHY=false
+            for i in {1..10}; do
+              if curl -k https://localhost:8443 > /dev/null 2>&1; then
+                echo "✅ Health check passed"
+                HEALTHY=true
+                break
+              fi
+              echo "Retry $i..."
+              sleep 3
+            done
+
+            if [ "$HEALTHY" = true ]; then
+
+              echo "🚀 Promoting $NEXT to production"
+
+              docker stop ${PREFIX}-${CURRENT} || true
+              docker rm ${PREFIX}-${CURRENT} || true
+
+              docker stop ${PREFIX}-${NEXT}
+              docker rm ${PREFIX}-${NEXT}
+
+              docker run -d \
+                --name ${PREFIX}-${NEXT} \
+                -p 80:80 -p 443:443 \
+                $IMAGE
+
+              echo "🎉 Deployment successful: $NEXT is live"
+
+            else
+              echo "❌ Health check failed → rollback"
+
+              docker logs ${PREFIX}-${NEXT}
+
+              docker stop ${PREFIX}-${NEXT} || true
+              docker rm ${PREFIX}-${NEXT} || true
+
+              echo "🛑 Rollback complete (still running $CURRENT)"
+              exit 1
+            fi
